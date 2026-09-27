@@ -6,3 +6,4 @@ rapidfuzz==3.14.6
 scikit-learn==1.9.1
 scipy==1.17.1
 lightgbm==4.7.0
+pytest==9.1.1

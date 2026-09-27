@@ -181,6 +181,32 @@ def tune_threshold(Fv, pv, truth, s1_val, tag):
     return best
 
 
+def val_subfolds(s1_val):
+    """split the validation S1 ids into two independent, deterministic halves:
+    'selection' (threshold tuning + stage-1/stage-2 choice) and 'report' (only
+    used to compute the reported score, never for any decision)."""
+    sel = (s1_val.hash(seed=1234) % 2) == 0
+    return s1_val.filter(sel), s1_val.filter(~sel)
+
+
+def select_and_report(Fv, pv1, pv2, truth, s1_val):
+    """choose the model and threshold on the selection subfold, then score the
+    choice once on the report subfold. decide() still runs over all validation
+    candidates, because S1 entities of both subfolds compete for the same S2/S3
+    records exactly as on test."""
+    s1_sel, s1_rep = val_subfolds(s1_val)
+    best1 = tune_threshold(Fv, pv1, truth, s1_sel, "stage 1, selection subfold")
+    best2 = tune_threshold(Fv, pv2, truth, s1_sel, "stage 2, selection subfold")
+    use2 = best2[0] > best1[0]
+    thr = best2[1] if use2 else best1[1]
+    f_rep, _ = macro_f05(decide(Fv, pv2 if use2 else pv1, thr), truth, s1_rep)
+    return dict(val_f05=f_rep, threshold=thr, use_stage2=bool(use2),
+                val_f05_selection=best2[0] if use2 else best1[0],
+                val_f05_stage1_selection=best1[0], threshold_stage1=best1[1],
+                val_f05_stage2_selection=best2[0], threshold_stage2=best2[1],
+                n_s1_selection=len(s1_sel), n_s1_report=len(s1_rep))
+
+
 def stage_train(args):
     """stage 1: LightGBM on pair features (+ 2-fold out-of-fold predictions);
     stage 2: LightGBM on pair features + cluster-consistency features.
@@ -207,7 +233,6 @@ def stage_train(args):
     m1.save_model(os.path.join(args.work, "model_s1.txt"))
     pv1 = m1.predict(Xv)
     log(f"stage 1: {m1.best_iteration} rounds")
-    best1 = tune_threshold(Fv, pv1, truth, s1_val, "stage 1")
     fold = (Ft["id1"].hash(seed=7) % 2 == 0).to_numpy()
     pt1 = np.zeros(Ft.height, dtype=np.float64)
     for k in (True, False):
@@ -225,23 +250,20 @@ def stage_train(args):
     m2.save_model(os.path.join(args.work, "model_s2.txt"))
     pv2 = m2.predict(to_X(Gv, cols2))
     log(f"stage 2: {m2.best_iteration} rounds")
-    best2 = tune_threshold(Fv, pv2, truth, s1_val, "stage 2")
 
-    use2 = best2[0] > best1[0]
-    best = best2 if use2 else best1
+    sel = select_and_report(Fv, pv1, pv2, truth, s1_val)
+    use2 = sel["use_stage2"]
     model = m2 if use2 else m1
     fcols = cols2 if use2 else cols
     ceil = int(yv.sum()) / truth.height
     imp = dict(zip(fcols, model.feature_importance("gain").round().astype(int).tolist()))
-    rep = dict(val_f05=best[0], threshold=best[1], use_stage2=bool(use2),
-               val_f05_stage1=best1[0], threshold_stage1=best1[1],
-               val_f05_stage2=best2[0], threshold_stage2=best2[1],
-               blocking_recall_val=ceil, candidates_per_s1_val=Fv.height / len(s1_val),
+    rep = dict(**sel, blocking_recall_val=ceil, candidates_per_s1_val=Fv.height / len(s1_val),
                n_train_pairs=Ft.height, features=cols, features2=cols2,
                importance=dict(sorted(imp.items(), key=lambda x: -x[1])))
     with open(os.path.join(args.work, "train_report.json"), "w") as f:
         json.dump(rep, f, indent=1)
-    log(f"VAL macro F0.5 = {best[0]:.5f} (stage {2 if use2 else 1}) at thr={best[1]:.3f}; "
+    log(f"VAL macro F0.5 (report subfold) = {sel['val_f05']:.5f}, selection subfold = "
+        f"{sel['val_f05_selection']:.5f} (stage {2 if use2 else 1}) at thr={sel['threshold']:.3f}; "
         f"blocking recall={ceil:.4f}; candidates/S1={rep['candidates_per_s1_val']:.2f}")
 
 

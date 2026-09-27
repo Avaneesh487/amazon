@@ -207,12 +207,40 @@ leakage. The whole model is a few MB of trees, well under the 8 B-parameter limi
 and no pretrained model is used.
 
 **Decoding and threshold selection.** Each S2/S3 record is assigned to its single most
-probable S1 (1-to-1 constraint), and the pair is kept if p ≥ threshold. The
-threshold maximises **macro F0.5 on the validation S1 entities**, including
-singletons and entities without any candidate. The validation entities are a
-deterministic 20 % hash split of training S1 ids; blocking was run over *all*
-training records, so every validation entity competes with the full distractor
-pool just as in test. Selected threshold: 0.70 (stage 1 alone: 0.675).
+probable S1 (1-to-1 constraint). Exact probability ties go to the lowest S1 id, so
+the assignment is deterministic. The pair is kept if p ≥ threshold. Before the
+output files are written, a guardrail (`assert_one_to_one`) stops the run if any
+S2/S3 record is matched to more than one S1. The threshold maximises **macro F0.5**,
+counting singletons and entities without any candidate.
+
+**Validation discipline.** `val_s1_ids()` is the single definition of the
+validation fold: a deterministic hash selects 20 % of training S1 ids. None of the
+following learns from these entities: the blocking pruner (excluded before its
+logistic regression is fitted), the stage-1 model, the out-of-fold stage-1 models,
+or the stage-2 model. Blocking still runs over *all* training records, so every
+validation entity competes with the full distractor pool exactly as on test. The
+fold is split once more by a second hash (`val_subfolds()`):
+
+* the **selection** half tunes the thresholds and chooses between stage 1 and stage 2;
+* the **report** half is used only to compute the reported score, so that number
+  was not used for any decision.
+
+Remaining known optimism: LightGBM early stopping still monitors the whole 20 % fold.
+
+**Country handling (audit).** Records are compared only inside the same exact
+country label; there is no canonicalisation step. On 2026-09-27 we checked this on
+the released data:
+
+* Train uses exactly `US` and `India` in all three sources.
+* Test uses `US`, `India` and `France` in all three sources, with identical spelling
+  (test S1: France 259,452, India 809,986, US 663,106 records).
+* In an audited sample of 300 k training S1 entities, 0 ground-truth matches had a
+  different country label from their S1 record.
+
+So country canonicalisation was checked and found unnecessary for this dataset.
+Test France has French street types and legal forms in the normalisation
+vocabulary; regions and departments are not mapped and get little weight through
+per-country IDF instead.
 
 ---
 
@@ -220,8 +248,14 @@ pool just as in test. Selected threshold: 0.70 (stage 1 alone: 0.675).
 
 - **F_0.5 Score (macro), validation (441 k held-out S1 entities, India + US):**
   - stage 1: 0.97909
-  - **stage 2: 0.98093**
+  - **stage 2: 0.98093**, at threshold 0.70 (stage 1 alone: 0.675)
   - blocking recall ceiling: 96.7 % of true pairs at 4.95 candidates per S1.
+  - *These numbers come from the run that produced the submitted output files.
+    That run predates the validation-discipline fixes: its pruner had also been fitted
+    on the validation entities, and model choice, thresholds and the reported score
+    all used the same 20 % fold. They are therefore slightly optimistic upper bounds.
+    Re-running `pruner` → `feats` → `train` → `predict` with the current code
+    produces a report-half score that no decision has used.*
 - **Test output:** 3.27 matches per S1; 6.3 % of S1 entities predicted as
   singletons (5.8 % France, 6.8 % India, 5.9 % US; the train singleton rate is
   5.6 %). The per-country rates are very similar, which is a good sign that the
@@ -280,6 +314,8 @@ decoding, reaches a validation macro F0.5 of 0.981. Lessons learned:
 | `src/blocking.py` | hashed multi-key blocking, block caps, cheap score, pre-pruning, logistic pruning |
 | `src/features.py` | pairwise features |
 | `src/stage2.py` | cluster-consistency features |
+| `tests/` | pytest unit tests on synthetic data (validation split, pruner exclusion, 1-to-1 tie-break, output ordering, model-selection subfolds); run `pytest tests/` |
+| `utils/validate_submission.py` | the organisers' validator, unmodified |
 | `README.md`, `requirements.txt` | exact run instructions and pinned versions (Python 3.11, polars 1.44.2, rapidfuzz 3.14.6, LightGBM 4.7.0, scikit-learn 1.9.1, numpy 2.4.6, pyarrow 25.0.1) |
 
 Only the provided files are used: no external data, APIs, geocoders or pretrained
