@@ -62,6 +62,12 @@ def stage_pruner(args):
     P = pl.concat([pl.read_parquet(os.path.join(args.work, f)) for f in os.listdir(args.work)
                    if f.startswith("train_pre_")], how="diagonal_relaxed")
     P = P.join(gt, on=["id1", "src", "id2"], how="left").with_columns(pl.col("y").fill_null(0))
+    # never let the pruner see labels of validation S1 entities
+    val = val_s1_ids(args.work)
+    held = P["id1"].is_in(val.implode())
+    log(f"pruner: excluding {len(val):,} validation S1 entities "
+        f"({int(held.sum()):,} of {P.height:,} pre-pruned pairs)")
+    P = P.filter(~held)
     w = blocking.fit_pruner(P, P["y"].to_numpy())
     json.dump(w, open(os.path.join(args.work, "pruner.json"), "w"), indent=1)
     log(f"pruner weights: {w}")
@@ -111,11 +117,27 @@ def is_val(id_expr):
     return (id_expr.hash(seed=42) % 5) == 0
 
 
+def val_s1_ids(work):
+    """the single canonical validation split: ids of the held-out 20 % of train S1.
+    Used by pruner fitting, LightGBM training, threshold tuning and reporting."""
+    ids = pl.read_parquet(os.path.join(work, "train_s1.parquet"), columns=["id"])["id"]
+    return ids.filter(is_val(ids))
+
+
 def decide(F, prob, thr):
     """1-to-1: each S2/S3 record goes to its most probable S1; keep if >= thr."""
     D = F.select("id1", "id2", "src").with_columns(pl.Series("p", prob))
-    D = D.filter(pl.col("p") == pl.col("p").max().over("id2", "src"))
+    # exactly one S1 per (src, id2): highest p, exact ties broken by lowest id1
+    D = (D.sort(["src", "id2", "p", "id1"], descending=[False, False, True, False])
+          .unique(subset=["src", "id2"], keep="first", maintain_order=True))
     return D.filter(pl.col("p") >= thr)
+
+
+def assert_one_to_one(D):
+    """guardrail: no S2/S3 record may be matched to more than one S1."""
+    dup = D.group_by("src", "id2").agg(pl.col("id1").n_unique().alias("n")).filter(pl.col("n") > 1)
+    if dup.height:
+        raise AssertionError(f"{dup.height} S2/S3 records assigned to >1 S1, e.g. {dup.head(5).to_dicts()}")
 
 
 def macro_f05(pred, truth, s1_ids):
@@ -169,13 +191,12 @@ def stage_train(args):
     F = F.join(gt.with_columns(pl.lit(1, pl.UInt8).alias("y")), on=["id1", "src", "id2"],
                how="left", maintain_order="left").with_columns(pl.col("y").fill_null(0))
     cols = feature_cols(F)
-    val = is_val(F["id1"])
+    s1_val = val_s1_ids(args.work)
+    val = F["id1"].is_in(s1_val.implode())
     Ft, Fv = F.filter(~val), F.filter(val)
     del F
     gc.collect()
-    s1_all = pl.read_parquet(os.path.join(args.work, "train_s1.parquet"), columns=["id"])["id"]
-    s1_val = s1_all.filter(is_val(s1_all))
-    truth = gt.filter(is_val(pl.col("id1")))
+    truth = gt.filter(pl.col("id1").is_in(s1_val.implode()))
     log(f"train pairs {Ft.height:,} (pos {Ft['y'].mean():.3f}), val pairs {Fv.height:,}; "
         f"{len(cols)} stage-1 features")
 
@@ -228,7 +249,7 @@ def stage_train(args):
 def write_lists(path, header, s1_ids, pairs):
     """one row per S1 id; pairs: (id1, src, id2)."""
     lists = (pairs.select("id1", pl.format("S{}-{}", pl.col("src"), pl.col("id2")).alias("e"))
-                  .unique().sort("id1", "e").group_by("id1").agg(pl.col("e").str.join(",")))
+                  .unique().sort("id1", "e").group_by("id1", maintain_order=True).agg(pl.col("e").str.join(",")))
     out = (s1_ids.join(lists, left_on="id", right_on="id1", how="left")
                  .select(pl.format("S1-{}", pl.col("id")).alias(header[0]),
                          pl.col("e").fill_null("").alias(header[1])))
@@ -246,6 +267,7 @@ def stage_predict(args):
         F = stage2.group_features(F, prob, args.work, "test")
         prob = m2.predict(to_X(F, rep["features2"]))
     D = decide(F, prob, rep["threshold"])
+    assert_one_to_one(D)
     # keep S1 ids in the original file order
     s1_ids = pl.read_parquet(os.path.join(args.work, "test_s1.parquet"), columns=["id"])
     os.makedirs(args.out, exist_ok=True)
